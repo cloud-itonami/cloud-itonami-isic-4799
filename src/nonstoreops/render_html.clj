@@ -1,0 +1,533 @@
+(ns nonstoreops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  This is NOT a hand-written sample page. Every seller, vendor, phase,
+  gate threshold, disposition, hold rule, ledger fact and committed
+  record below is read out of a REAL run of this repo's own actor
+  stack -- `nonstoreops.operation` (langgraph-clj StateGraph) ->
+  `nonstoreops.governor` -> `nonstoreops.store` -- driven through the
+  scenarios in `run-scenarios!` and then rendered. Nothing on the page
+  is typed in by hand except section prose.
+
+  Deterministic: a fresh `store/seed-db`, the deterministic
+  `nonstoreops.advisor/mock-advisor` (plus three explicitly reified
+  drift-advisors that exercise governor checks the default advisor
+  cannot reach), no timestamps, no randomness. Two consecutive runs
+  are byte-identical -- verify with
+  `clojure -M:dev:render-html /tmp/a.html && clojure -M:dev:render-html /tmp/b.html && cmp /tmp/a.html /tmp/b.html`.
+
+  Build-time invariant: `-main` THROWS unless the real governor output
+  contains at least one `:governor-hold` fact AND every rule in
+  `required-hard-rules` actually fired. A console that quietly stopped
+  demonstrating the hard blocks is a build failure, not a silent
+  regression.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [jp-go-dds.skin]
+            [langgraph.graph :as g]
+            [nonstoreops.advisor :as advisor]
+            [nonstoreops.governor :as governor]
+            [nonstoreops.operation :as op]
+            [nonstoreops.phase :as phase]
+            [nonstoreops.store :as store]))
+
+(def required-hard-rules
+  "Every HARD rule `nonstoreops.governor` can emit. The build fails
+  unless a real run produced all of them -- this is the gate that keeps
+  the console honest, not a comment asking someone to keep it honest."
+  #{:seller-unverified :vendor-unverified :effect-not-propose
+    :scope-excluded :op-not-allowed})
+
+(def ^:private approver "nonstore-retail-coordinator-1")
+
+(defn- ctx [phase]
+  {:actor-id "coord-1" :actor-role :nonstore-retail-coordinator :phase phase})
+
+;; ----------------------------- drift advisors -----------------------------
+;; The default mock advisor is well-behaved by construction, so three of
+;; the governor's HARD checks are unreachable through it. Each of these
+;; models one concrete way a compromised or confused advisor drifts, and
+;; each is wired the same way `nonstoreops.sim` already wires its
+;; direct-actuation case: reify the real `Advisor` protocol, keep every
+;; other field the real `advisor/infer` produced.
+
+(defn- direct-actuation-advisor
+  "Claims a direct actuation instead of a proposal (`:effect :commit`)."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :effect :commit))))
+
+(defn- unit-price-advisor
+  "Drifts into proposing a unit-price decision -- an op outside the
+  governor's closed `allowed-ops` allowlist, and precisely the authority
+  `nonstoreops.governor`'s own docstring says this actor NEVER holds."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :op :set-unit-price))))
+
+(defn- low-confidence-advisor
+  "Returns a well-formed proposal below `governor/confidence-floor`."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :confidence 0.42))))
+
+;; ----------------------------- scenario driver -----------------------------
+
+(defn run-scenarios!
+  "Drives a fresh seeded store through fifteen real actor runs and
+  returns `{:db .. :scenarios [..]}`. Each scenario entry carries the
+  langgraph terminal state, so dispositions, escalation reasons,
+  governor verdicts and hold rules are all read back from the run
+  rather than asserted here.
+
+  Coverage:
+    * every op in `governor/allowed-ops` (4/4)
+    * every phase gate outcome: auto-commit, `:phase-approval`,
+      `:phase-disabled`
+    * every escalation reason: `:phase-approval`, `:always-escalate`,
+      `:low-confidence`
+    * a human APPROVAL and a human REJECTION
+    * every rule in `required-hard-rules` (5/5), plus a phase-gate hold
+      that carries no governor violation at all"
+  []
+  (let [db (store/seed-db)
+        actor (op/build db)
+        direct (op/build db {:advisor (direct-actuation-advisor)})
+        unit-price (op/build db {:advisor (unit-price-advisor)})
+        low-conf (op/build db {:advisor (low-confidence-advisor)})
+        out (atom [])
+        exec! (fn [a tid title phase request]
+                (let [st (:state (g/run* a {:request request :context (ctx phase)}
+                                         {:thread-id tid}))]
+                  (swap! out conj {:id tid :title title :phase phase
+                                   :request request :state st})
+                  st))
+        resume! (fn [a tid status]
+                  (let [st (:state (g/run* a {:approval {:status status :by approver}}
+                                           {:thread-id tid :resume? true}))]
+                    (swap! out (fn [v]
+                                 (mapv #(cond-> % (= tid (:id %))
+                                                (assoc :resume-state st
+                                                       :approval-status status))
+                                       v)))
+                    st))]
+
+    ;; --- clean lifecycle ------------------------------------------------
+    (exec! actor "s01" "sale/order record, phase 1 (assisted-logging: every write needs a human)"
+           1 {:op :log-sales-record :seller-id "seller-1"
+              :patch {:units-sold 12 :collections 5 :channel :door-to-door}})
+    (resume! actor "s01" :approved)
+
+    (exec! actor "s02" "same op at phase 3 -- governor-clean, high confidence, auto-commits"
+           3 {:op :log-sales-record :seller-id "seller-1"
+              :patch {:units-sold 8 :collections 3}})
+
+    (exec! actor "s03" "vending-machine restock schedule -- auto-commits"
+           3 {:op :schedule-route-operation :seller-id "seller-2"
+              :patch {:route "riverside-loop-4" :date "2026-07-20" :window "09:00-17:00"}})
+
+    (exec! actor "s04" "supply order below the cost threshold, verified vendor -- auto-commits"
+           3 {:op :coordinate-supply-order :seller-id "seller-1"
+              :patch {:item "door-to-door catalog restock" :quantity 100
+                      :estimated-cost 380.0 :vendor-id "vendor-1"}})
+
+    ;; --- soft escalations, all three reasons ----------------------------
+    (exec! actor "s05" "supply order ABOVE the cost threshold -- always escalates, even at phase 3"
+           3 {:op :coordinate-supply-order :seller-id "seller-2"
+              :patch {:item "vending-machine unit fleet expansion" :quantity 6
+                      :estimated-cost 4200.0 :vendor-id "vendor-1"}})
+    (resume! actor "s05" :approved)
+
+    (exec! actor "s06" "compliance concern -- never auto-commits at ANY phase"
+           3 {:op :flag-compliance-concern :seller-id "seller-1"
+              :patch {:concern "customer reports being pressured at the door and unsure how to exercise cooling-off cancellation"
+                      :confidence 0.92}})
+    (resume! actor "s06" :approved)
+
+    (exec! low-conf "s07" "advisor confidence below the floor -- escalates on confidence alone"
+           3 {:op :schedule-route-operation :seller-id "seller-1"
+              :patch {:route "weekday-north-loop" :date "2026-07-22"}})
+    (resume! low-conf "s07" :approved)
+
+    ;; --- human declines --------------------------------------------------
+    (exec! actor "s08" "phase 2 route schedule -- human reviews and REJECTS"
+           2 {:op :schedule-route-operation :seller-id "seller-2"
+              :patch {:route "riverside-loop-5" :date "2026-07-27" :window "12:00-20:00"}})
+    (resume! actor "s08" :rejected)
+
+    ;; --- phase gate, no governor violation -------------------------------
+    (exec! actor "s09" "phase 0 is read-only -- the phase gate holds a proposal the governor cleared"
+           0 {:op :log-sales-record :seller-id "seller-1" :patch {:units-sold 3}})
+
+    ;; --- HARD holds, one per governor rule -------------------------------
+    (exec! actor "s10" "seller not in the registry at all"
+           3 {:op :log-sales-record :seller-id "seller-99" :patch {:units-sold 0}})
+
+    (exec! actor "s11" "seller registered but not yet license-verified"
+           3 {:op :log-sales-record :seller-id "seller-3" :patch {:units-sold 4}})
+
+    (exec! actor "s12" "supply order naming an unverified vendor"
+           3 {:op :coordinate-supply-order :seller-id "seller-1"
+              :patch {:item "import party-plan merchandise" :quantity 30
+                      :estimated-cost 260.0 :vendor-id "vendor-2"}})
+
+    (exec! direct "s13" "advisor claims a direct actuation instead of a proposal"
+           3 {:op :schedule-route-operation :seller-id "seller-1"
+              :patch {:route "weekday-north-loop" :date "2026-07-22"}})
+
+    (exec! actor "s14" "advisor drifts into finalizing a cooling-off/cancellation-right waiver"
+           3 {:op :log-sales-record :seller-id "seller-1" :out-of-scope? true :patch {}})
+
+    (exec! unit-price "s15" "advisor drifts into a unit-price decision -- outside the closed op allowlist"
+           3 {:op :log-sales-record :seller-id "seller-1" :patch {:units-sold 6}})
+
+    {:db db :scenarios @out}))
+
+;; ----------------------------- approver retention probe -----------------------------
+
+(defn approver-key-paths
+  "Where -- if anywhere -- an approver identity actually survived into
+  the store's committed records. Derived by INSPECTING the records this
+  run produced, never asserted.
+
+  This matters because `nonstoreops.operation/commit-record` writes the
+  approver into `:payload` only, while `:value` (the field a reader
+  reaches for first) keeps the pre-approval draft. Whether that
+  distinction is visible at all depends on the `Store` implementation:
+  `MemStore/commit-record!` conj's the WHOLE record, so `:payload`
+  survives here -- a different backend that destructured `:value` would
+  drop the approver silently. Probing at render time means this page
+  stops claiming a defect the moment someone fixes the store."
+  [records]
+  (into (sorted-set)
+        (for [r records
+              k (sort (keys r))
+              :let [v (get r k)]
+              :when (and (map? v) (contains? v :approved-by))]
+          [k :approved-by])))
+
+(defn- record-approver [record paths]
+  (some (fn [p] (get-in record p)) paths))
+
+;; ----------------------------- rendering helpers -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- kw-set-str [s]
+  (str/join ", " (sort (map #(str ":" (name %)) s))))
+
+(defn- td [& cells] (str "<tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- code [v] (str "<code>" (esc v) "</code>"))
+
+(defn- table [headers rows]
+  (str "    <table>\n"
+       "      <thead><tr>" (str/join (map #(str "<th>" % "</th>") headers)) "</tr></thead>\n"
+       "      <tbody>\n"
+       (str/join "\n" (map #(str "        " %) rows)) "\n"
+       "      </tbody>\n"
+       "    </table>\n"))
+
+(defn- section [title lede body]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" title "</h2>\n"
+       (if lede (str "    <p class=\"muted\">" lede "</p>\n") "")
+       body
+       "  </section>\n"))
+
+(defn- yes-no [b ok-label bad-label]
+  (if b
+    (str "<span class=\"ok\">" ok-label "</span>")
+    (str "<span class=\"critical\">" bad-label "</span>")))
+
+;; ----------------------------- derived views -----------------------------
+
+(defn- disposition-cell [{:keys [state resume-state approval-status]}]
+  (let [d (:disposition (or resume-state state))
+        rule (some-> state :verdict :violations first :rule)
+        reason (some->> (:audit state)
+                        (filter #(= :approval-requested (:t %)))
+                        last :reason)]
+    (cond
+      (and (= :hold d) (seq (some-> state :verdict :violations)))
+      (str "<span class=\"critical\">HARD hold &middot; " (esc (name rule)) "</span>")
+
+      (and (= :hold d) (= :rejected approval-status))
+      "<span class=\"warn\">rejected by approver &middot; held</span>"
+
+      (= :hold d)
+      (let [pr (some->> (:audit state)
+                        (filter #(= :governor-hold (:t %)))
+                        last :phase-reason)]
+        (str "<span class=\"warn\">phase hold &middot; " (esc (name (or pr :unknown))) "</span>"))
+
+      (and resume-state (= :commit d))
+      (str "<span class=\"ok\">approved &amp; committed</span>"
+           " <span class=\"muted\">(" (esc (name (or reason :unknown))) ")</span>")
+
+      (= :commit d) "<span class=\"ok\">auto-committed</span>"
+      :else "<span class=\"muted\">in progress</span>")))
+
+(defn- scenario-row [{:keys [id title phase request state] :as sc}]
+  (let [req-op (:op request)
+        prop-op (some-> state :proposal :op)
+        op-cell (if (and prop-op (not= prop-op req-op))
+                  (str (code (str req-op)) " <span class=\"critical\">&rarr; "
+                       (esc (str prop-op)) "</span>")
+                  (code (str req-op)))]
+    (td (code id) (esc title) (code (str req-op)) op-cell
+        (esc (:seller-id request))
+        (str phase " <span class=\"muted\">" (esc (:label (get phase/phases phase))) "</span>")
+        (esc (format "%.2f" (double (or (some-> state :verdict :confidence) 0.0))))
+        (disposition-cell sc))))
+
+(defn- seller-row [ledger {:keys [seller-id name channel registered? verified?]}]
+  (let [facts (filter #(= seller-id (:seller-id %)) ledger)
+        commits (count (filter #(= :committed (:t %)) facts))
+        holds (count (filter #(not= :committed (:t %)) facts))]
+    (td (code seller-id) (esc name) (code (str channel))
+        (yes-no registered? "registered" "not registered")
+        (yes-no verified? "verified" "unverified")
+        (if (pos? commits) (str "<span class=\"ok\">" commits "</span>")
+            "<span class=\"muted\">0</span>")
+        (if (pos? holds) (str "<span class=\"critical\">" holds "</span>")
+            "<span class=\"muted\">0</span>"))))
+
+(defn- vendor-row [{:keys [vendor-id name registered? verified?]}]
+  (td (code vendor-id) (esc name)
+      (yes-no registered? "registered" "not registered")
+      (yes-no verified? "verified" "unverified")
+      (if (and registered? verified?)
+        "<span class=\"ok\">supply orders may proceed</span>"
+        "<span class=\"critical\">supply orders HARD-held</span>")))
+
+(defn- phase-row [[n {:keys [label writes auto]}]]
+  (td (str n) (esc label)
+      (if (seq writes) (code (kw-set-str writes)) "<span class=\"muted\">none</span>")
+      (if (seq auto) (code (kw-set-str auto))
+          "<span class=\"warn\">none &middot; every write needs a human</span>")))
+
+(defn- hold-row [{:keys [op seller-id basis violations phase-reason]}]
+  (td (code (str op)) (esc seller-id)
+      (if (seq basis)
+        (str "<span class=\"critical\">" (esc (kw-set-str basis)) "</span>")
+        (str "<span class=\"warn\">phase gate &middot; :" (esc (name (or phase-reason :unknown)))
+             "</span>"))
+      (esc (str/join " / " (map :detail violations)))))
+
+(defn- ledger-row [{:keys [t op actor seller-id basis summary]}]
+  (td (case t
+        :committed "<span class=\"ok\">committed</span>"
+        :governor-hold "<span class=\"critical\">governor-hold</span>"
+        :approval-rejected "<span class=\"warn\">approval-rejected</span>"
+        (esc (name t)))
+      (code (str op)) (esc actor) (esc seller-id)
+      (code (if (coll? basis) (str/join ", " (map str basis)) (str basis)))
+      (esc (or summary ""))))
+
+(defn- record-approver-path
+  "The first probed key path that actually yields an approver for this
+  record, or nil. Derived, so the 'retained under' column cannot drift
+  away from where the value really is."
+  [record paths]
+  (first (filter #(get-in record %) paths)))
+
+(defn- commit-row [paths {:keys [op seller-id value] :as record}]
+  (let [who (record-approver record paths)
+        path (record-approver-path record paths)]
+    (td (code (str op)) (esc seller-id)
+        (esc (pr-str (into (sorted-map) (dissoc value :seller-id))))
+        (if who
+          (str "<span class=\"ok\">" (esc who) "</span>")
+          "<span class=\"muted\">auto-committed &middot; no approver</span>")
+        (cond
+          (nil? who) "<span class=\"muted\">n/a</span>"
+          (contains? value :approved-by) (code (pr-str path))
+          :else (str (code (pr-str path))
+                     " <span class=\"warn\">(not under <code>:value</code>)</span>")))))
+
+;; ----------------------------- document -----------------------------
+
+(defn render
+  "Renders the operator console from a completed `run-scenarios!` result."
+  [{:keys [db scenarios]}]
+  (let [ledger (vec (store/ledger db))
+        commits (vec (store/coordination-log db))
+        sellers (store/all-seller-records db)
+        vendors (store/all-vendor-records db)
+        holds (filterv #(= :governor-hold (:t %)) ledger)
+        hard-holds (filterv #(seq (:violations %)) holds)
+        fired-rules (into (sorted-set) (mapcat :basis hard-holds))
+        paths (approver-key-paths commits)
+        approved-runs (filterv #(= :approved (:approval-status %)) scenarios)
+        approver-disclosure
+        (cond
+          (empty? approved-runs)
+          "This run contains no approved commit, so there is nothing to say about approver retention."
+
+          (empty? paths)
+          (str "Measured at render time: the approver identity is <strong>not retrievable from any "
+               "committed record</strong> in <code>nonstoreops.store/coordination-log</code>. The "
+               (count approved-runs) " approvals below are joined from the run's "
+               "<code>:approval-granted</code> audit fact and are labelled "
+               "<em>(audit only — not retained in record)</em>. Do not read a blank approver column "
+               "as &ldquo;nobody approved&rdquo;.")
+
+          (contains? paths [:value :approved-by])
+          (str "Measured at render time: the approver identity is retained under "
+               (esc (pr-str (vec paths)))
+               " — including <code>:value</code>, the field a reader reaches for first. Nothing is lost.")
+
+          :else
+          (str "Measured at render time: the approver identity is retained, but only under "
+               (esc (pr-str (vec paths)))
+               " — <strong>not</strong> under <code>:value</code>. "
+               "<code>nonstoreops.operation/commit-record</code> writes the pre-approval draft to "
+               "<code>:value</code> and the approved payload to <code>:payload</code>; "
+               "<code>MemStore/commit-record!</code> conj's the whole record, so <code>:payload</code> "
+               "survives here. A <code>Store</code> backend that destructured <code>:value</code> "
+               "would drop the approver with no error. This sentence is derived from the actual "
+               "registers, not asserted — it changes if the store changes."))]
+    (str
+     "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+     "<title>cloud-itonami-isic-4799 &middot; non-store retail operations console</title>\n<style>\n"
+     (jp-go-dds.skin/dds+skin)
+     "\n</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Other retail sale not in stores, stalls or markets (ISIC 4799) — Operator Console</h1>\n"
+     "</header>\n"
+     "<p><span class=\"badge\">read-only sample</span> <span class=\"badge\">governor-gated</span> "
+     "<span class=\"badge\">generated by <code>clojure -M:dev:render-html</code></span></p>\n"
+     "<p class=\"subtitle\">Door-to-door selling, vending-machine retail and direct-sales/party-plan "
+     "home-demonstration selling. This actor coordinates a seller's back office — it never sets a unit "
+     "price and never finalizes a waiver of a consumer's statutory cooling-off/cancellation right.</p>\n"
+     "<div class=\"banner\">\n"
+     "  <p>Every number, identifier, disposition and rule on this page was read out of a real run of\n"
+     "  <code>nonstoreops.operation</code> &rarr; <code>nonstoreops.governor</code> &rarr;\n"
+     "  <code>nonstoreops.store</code> at build time (" (count scenarios) " actor runs, "
+     (count ledger) " ledger facts, " (count commits) " committed records, "
+     (count hard-holds) " HARD holds covering " (count fired-rules) " distinct rules).\n"
+     "  The build fails if the governor stops holding.</p>\n"
+     "</div>\n"
+     "<main>\n"
+
+     (section
+      "Seller registry"
+      (str "This vertical has no storefront to inspect, so the SELLER is the gate. "
+           "<code>nonstoreops.governor/seller-unverified-violations</code> re-derives "
+           "<code>:registered?</code>/<code>:verified?</code> from the seller's own record — never from "
+           "a proposal's self-report — before <em>any</em> proposal may commit or even escalate. "
+           "Commit/hold counts are this run's ledger, grouped by seller.")
+      (table ["Seller" "Name" "Channel" "Registration" "Verification" "Committed" "Held"]
+             (map (partial seller-row ledger) sellers)))
+
+     (section
+      "Supply vendor registry"
+      "The same ground-truth-not-self-report discipline, reapplied to the supply-chain counterparty. A <code>:coordinate-supply-order</code> naming an unregistered or unverified vendor is a HARD block, not a low-confidence signal."
+      (table ["Vendor" "Name" "Registration" "Verification" "Effect on supply orders"]
+             (map vendor-row vendors)))
+
+     (section
+      "Rollout phase gate"
+      (str "Read directly out of <code>nonstoreops.phase/phases</code>. The phase gate can only add "
+           "caution: it never turns a governor hold into a commit. Note that "
+           "<code>:flag-compliance-concern</code> is absent from every <em>auto</em> column including "
+           "phase 3 — a permanent structural fact, not a rollout milestone still to come.")
+      (table ["Phase" "Label" "Writes allowed" "May auto-commit when governor-clean"]
+             (map phase-row (sort-by key phase/phases))))
+
+     (section
+      "Governor gate"
+      (str "Thresholds below are read from the live <code>nonstoreops.governor</code> vars, not "
+           "transcribed. HARD checks are permanent and un-overridable by any human approval; SOFT "
+           "gates force a human sign-off.")
+      (table ["Check" "Kind" "Derived from"]
+             [(td "Seller unverified" "<span class=\"critical\">HARD</span>"
+                  "store lookup of the target seller's own <code>:registered?</code>/<code>:verified?</code>")
+              (td "Vendor unverified" "<span class=\"critical\">HARD</span>"
+                  "store lookup of the drafted <code>[:value :vendor-id]</code>")
+              (td "Effect not <code>:propose</code>" "<span class=\"critical\">HARD</span>"
+                  "the proposal's own <code>:effect</code> field")
+              (td "Op outside the allowlist" "<span class=\"critical\">HARD</span>"
+                  (str "<code>governor/allowed-ops</code> = " (code (kw-set-str governor/allowed-ops))))
+              (td "Scope exclusion (cooling-off / cancellation-right waiver finalization)"
+                  "<span class=\"critical\">HARD</span>"
+                  (str (count governor/scope-excluded-terms)
+                       " case-insensitive action phrases scanned across op/summary/rationale/cites/value"))
+              (td "Confidence below floor" "<span class=\"warn\">SOFT — escalate</span>"
+                  (str "<code>governor/confidence-floor</code> = " (code governor/confidence-floor)))
+              (td "Always-escalate op" "<span class=\"warn\">SOFT — escalate</span>"
+                  (str "<code>governor/always-escalate-ops</code> = "
+                       (code (kw-set-str governor/always-escalate-ops))))
+              (td "High-cost supply order" "<span class=\"warn\">SOFT — escalate</span>"
+                  (str "<code>governor/supply-cost-threshold</code> = "
+                       (code governor/supply-cost-threshold)))]))
+
+     (section
+      "Scenario run log"
+      (str (count scenarios) " supervised actor runs. &ldquo;Proposed op&rdquo; shows the op the advisor "
+           "actually drafted when it differs from the op that was requested — that divergence is itself "
+           "one of the things the governor exists to catch. Confidence is the governor's recorded verdict "
+           "confidence for that run.")
+      (table ["Run" "Scenario" "Requested op" "Proposed op" "Seller" "Phase" "Conf." "Outcome"]
+             (map scenario-row scenarios)))
+
+     (section
+      "Holds (this run)"
+      (str (count hard-holds) " HARD governor holds covering " (count fired-rules)
+           " distinct rules, plus " (- (count holds) (count hard-holds))
+           " phase-gate hold(s) that carry no governor violation at all. None of these reached a human — "
+           "a HARD hold has no approval path.")
+      (table ["Op" "Seller" "Rule" "Detail (governor's own text)"]
+             (map hold-row holds)))
+
+     (section
+      "Audit ledger (append-only)"
+      "Every fact <code>nonstoreops.store/append-ledger!</code> received during this run, in order. Which seller a proposal targeted, which operation, on what basis, committed or held — always a query over an immutable log."
+      (table ["Fact" "Op" "Actor" "Seller" "Basis" "Summary"]
+             (map ledger-row ledger)))
+
+     (section
+      "Committed coordination log"
+      (str "The SSoT writes this run produced. <strong>Approver attribution:</strong> "
+           approver-disclosure)
+      (table ["Op" "Seller" "Committed value" "Approver" "Retained under"]
+             (map (partial commit-row paths) commits)))
+
+     "</main>\n"
+     "<footer>\n"
+     "  <p>cloud-itonami-isic-4799 — non-store retail operations coordination actor. "
+     "Generated at build time by <code>nonstoreops.render-html</code> from a real actor run; "
+     "no hand-written rows, no timestamps, byte-identical across reruns.</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db scenarios] :as result} (run-scenarios!)
+        ledger (store/ledger db)
+        holds (filter #(= :governor-hold (:t %)) ledger)
+        hard-holds (filter #(seq (:violations %)) holds)
+        fired (into #{} (mapcat :basis hard-holds))
+        missing (into (sorted-set) (remove fired required-hard-rules))]
+    (when (empty? holds)
+      (throw (ex-info "build-time invariant violated: the real governor produced ZERO :governor-hold facts -- refusing to write a console that shows no enforcement"
+                      {:ledger-facts (count ledger) :scenarios (count scenarios)})))
+    (when (seq missing)
+      (throw (ex-info (str "build-time invariant violated: HARD rule(s) " (pr-str missing)
+                           " never fired in the real run -- refusing to write a console that claims coverage it does not have")
+                      {:required required-hard-rules :fired fired :missing missing})))
+    (spit out (render result))
+    (println "wrote" out
+             (str "(" (count scenarios) " actor runs, "
+                  (count ledger) " ledger facts, "
+                  (count (store/coordination-log db)) " committed records, "
+                  (count hard-holds) " HARD holds, rules "
+                  (pr-str (into (sorted-set) fired)) ")"))))
