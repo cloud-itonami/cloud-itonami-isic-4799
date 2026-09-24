@@ -1,6 +1,6 @@
 (ns nonstoreops.advisor-test
   "Unit tests of `nonstoreops.advisor` proposal generation."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [nonstoreops.advisor :as adv]
             [nonstoreops.store :as store]))
 
