@@ -1,0 +1,44 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": a robot may perform the physical work of
+;; non-store retail (ISIC 4799) -- autonomous vending-machine restocking and
+;; last-mile route delivery for door-to-door catalogue drops. Here: an arm
+;; loading a case of drinks into a vending column, how long the freshly
+;; loaded (warm) cans take to chill, and a sidewalk delivery robot climbing
+;; a steep street on its route.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-4799"
+ :cases
+ [{:id :drinks-case-into-vending-column
+   :kind :manipulator
+   :procedure "arm lifts a case of drinks from the route van's tote and loads it into the vending machine's upper column"
+   :params {:l1-m 0.50 :l2-m 0.45 :m1-kg 4.5 :m2-kg 3.0
+            :from [0.60 0.10] :to [0.35 0.80] :duration-s 2.5 :steps 500}
+   :sweep {:param :payload-kg :values [2.0 5.0 9.0 12.5 15.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 110.0 :basis "estimate: continuous shoulder torque of a ~9 kg-payload collaborative arm; 24 x 350 mL cans is ~9 kg, 24 x 500 mL PET ~12.5 kg"}
+   :boundary {:lo 0.5 :hi 50.0}}
+  {:id :restocked-can-chill-down
+   :kind :thermal
+   :procedure "a can loaded warm (25 C) chills in the machine's 2 C cold air; half the 66 mm can is modelled as a slab of stirred water with the axis as a symmetry face"
+   :params {:thickness-m 0.033 :conductivity-w-mk 3.0 :density-kg-m3 1000.0 :specific-heat-j-kgk 4180.0
+            :t0-c 25.0 :t-hot-c 2.0 :h-back-w-m2k 0.0 :duration-s 21600.0 :nodes 21
+            :threshold-c 8.0 :threshold-direction :falling}
+   :sweep {:param :h-front-w-m2k :values [5.0 10.0 15.0 25.0 40.0]}
+   :quantity :time-to-threshold-s
+   :limit {:max 7200.0 :basis "estimate: a restocked can should be at serving temperature (8 C at its core) within ~2 h. The 3.0 W/mK is an effective conductivity (water 0.6 plus natural convection inside the can), also an estimate; the slab stands in for a cylinder"}
+   :boundary {:lo 3.0 :hi 80.0}}
+  {:id :delivery-robot-steep-street
+   :kind :transport
+   :procedure "sidewalk delivery robot carrying catalogue parcels climbs a 30 m steep street segment on its route"
+   :params {:mass-kg 45.0 :payload-kg 20.0 :distance-m 30.0 :v-max-mps 1.6 :a-max-mps2 0.5
+            :brake-decel-mps2 1.5 :drive-force-n 150.0 :crr 0.02 :cog-height-m 0.35 :payload-cog-height-m 0.45
+            :support-half-length-m 0.30 :max-time-s 600.0}
+   :sweep {:param :slope-deg :values [0.0 4.0 8.0 10.0 12.0 14.0]}
+   :quantity :cycle-time-s
+   :limit {:max 40.0 :basis "estimate: the 30 m segment should not take over ~40 s of the route's time budget; a stall is out of tolerance"}
+   :boundary {:lo 0.0 :hi 20.0}}]}
